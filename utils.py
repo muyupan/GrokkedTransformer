@@ -6,26 +6,99 @@ import torch.nn.functional as F
 from typing import Dict, List, Tuple, Optional
 import numpy as np
 
-def read_data_source_target(file_name, return_num=False, return_json=False):
+# def read_data_source_target(file_name, return_num=False, return_json=False):
+#     """
+#     file_name: a .json file containing a list of items, each has 'input_text', 'target_text', as keys
+#     """
+#     with open(file_name, 'r', encoding='utf-8') as f:
+#         data = json.load(f)
+
+#     if return_json:
+#         if return_num:
+#             return data, len(data)
+#         return data
+
+#     keys = list(data[0].keys())
+#     source_target_pair = []
+#     for item in data:
+#         source_target_pair.append([item[key] for key in keys])
+
+#     if return_num:
+#         return pd.DataFrame(source_target_pair, columns=keys), len(data)
+#     return pd.DataFrame(source_target_pair, columns=keys)
+
+def compute_bridge_grounding_score(model_states, bridge_labels, layer_idx=5, k=1):
     """
-    file_name: a .json file containing a list of items, each has 'input_text', 'target_text', as keys
+    Compute bridge entity grounding score from intermediate layer states.
+    
+    Args:
+        model_states: Hidden states from intermediate layers [batch, seq_len, hidden_dim]
+        bridge_labels: Ground truth bridge entity IDs [batch]
+        layer_idx: Which layer to extract bridge from (default 5, based on paper)
+        k: Top-k for scoring (default 1)
+    
+    Returns:
+        dict with 'bridge_grounding_score' and 'bridge_confidence'
     """
-    with open(file_name, 'r', encoding='utf-8') as f:
+    # Extract states at r1 position (where bridge should be stored)
+    bridge_states = model_states[layer_idx][:, -2, :]  # position r1
+    
+    # Project to vocabulary
+    logits = model.lm_head(model.final_layer_norm(bridge_states))
+    probs = F.softmax(logits, dim=-1)
+    
+    # Top-k accuracy
+    top_k_preds = torch.topk(logits, k=k, dim=-1).indices
+    correct = (top_k_preds == bridge_labels.unsqueeze(-1)).any(dim=-1).float()
+    
+    # Confidence (probability of correct bridge)
+    confidence = probs.gather(1, bridge_labels.unsqueeze(-1)).squeeze()
+    
+    return {
+        'bridge_grounding_score': correct.mean().item(),
+        'bridge_confidence': confidence.mean().item(),
+        'bridge_top1_accuracy': (top_k_preds[:, 0] == bridge_labels).float().mean().item()
+    }
+
+
+def read_data_source_target(file_path, return_num=False, return_json=False):
+    """
+    Read modular addition dataset and convert to OSU format
+    
+    Args:
+        file_path: Path to train.json, valid.json, or test.json
+        return_num: If True, return number of samples as second output
+        return_json: If True, return original JSON (unused for modular arithmetic)
+    
+    Returns:
+        DataFrame with 'input_text' and 'target_text' columns
+    """
+    import json
+    import pandas as pd
+    
+    with open(file_path, 'r') as f:
         data = json.load(f)
-
-    if return_json:
-        if return_num:
-            return data, len(data)
-        return data
-
-    keys = list(data[0].keys())
-    source_target_pair = []
-    for item in data:
-        source_target_pair.append([item[key] for key in keys])
-
+    
+    # Extract the data array
+    if isinstance(data, dict) and 'data' in data:
+        examples = data['data']
+    else:
+        examples = data
+    
+    # Convert to OSU format
+    formatted_data = []
+    for ex in examples:
+        formatted_data.append({
+            'input_text': ex['input'].strip(),
+            'target_text': ex['output'].strip()
+        })
+    
+    df = pd.DataFrame(formatted_data)
+    
     if return_num:
-        return pd.DataFrame(source_target_pair, columns=keys), len(data)
-    return pd.DataFrame(source_target_pair, columns=keys)
+        return df, len(df)
+    else:
+        return df
 
 def compute_accuracy(predictions: torch.Tensor, labels: torch.Tensor) -> float:
     """
@@ -205,3 +278,5 @@ def compute_hallucination_metrics(logits: torch.Tensor,
         'high_conf_count': high_conf_mask.float().sum().item(),
         'low_conf_count': low_conf_mask.float().sum().item()
     }
+
+def 

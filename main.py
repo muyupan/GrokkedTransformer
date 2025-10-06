@@ -133,7 +133,7 @@ def main():
         "dataloader_num_workers":args.dataloader_num_workers,
         "use_multiprocessed_decoding":args.use_multiprocessed_decoding,
         "save_best_model": args.save_best_model,
-        "save_model_every_epoch": args.save_model_every_epoch,
+        "save_model_every_epoch": False,
         "save_epoch_interval": args.save_epoch_interval,
         "scheduler": args.scheduler,
         "weight_decay": args.weight_decay,

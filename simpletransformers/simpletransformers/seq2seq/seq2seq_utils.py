@@ -425,9 +425,17 @@ class SimpleSummarizationDataset(Dataset):
             #     self.examples = [
             #         preprocess_data_bart(d) for d in tqdm(data, disable=args.silent)
             #     ]
-            self.examples = [
-                preprocess_data_bart(d) for d in tqdm(data, disable=args.silent)
-            ]
+            # self.examples = [
+            #     preprocess_data_bart(d) for d in tqdm(data, disable=args.silent)
+            # ]
+            if getattr(args, "model_type", "gpt2") == "gpt2":
+                self.examples = [
+                    preprocess_data_gpt2(d) for d in tqdm(data, disable=args.silent)
+                ]
+            else:
+                self.examples = [
+                    preprocess_data_bart(d) for d in tqdm(data, disable=args.silent)
+                ]
 
     def __len__(self):
         return len(self.examples)
@@ -557,3 +565,33 @@ def add_faiss_index_to_dataset(dataset):
     dataset.add_faiss_index("embeddings", custom_index=index)
 
     return dataset
+
+def preprocess_data_gpt2(args_tuple):
+    input_text, target_text, tokenizer, args = args_tuple
+
+    input_ids = tokenizer.encode(
+        input_text,
+        max_length=args.max_seq_length,
+        padding='max_length',
+        truncation=True,
+        return_tensors='pt'
+    ).squeeze()
+
+    target_ids = tokenizer.encode(
+        target_text,
+        max_length=args.max_length,
+        padding='max_length',
+        truncation=True,
+        return_tensors='pt'
+    ).squeeze()
+
+    # Mask padding tokens in lm_labels
+    lm_labels = target_ids.clone()
+    if hasattr(tokenizer, "pad_token_id") and tokenizer.pad_token_id is not None:
+        lm_labels[lm_labels == tokenizer.pad_token_id] = -100
+
+    return {
+        'input_ids': input_ids,
+        'target_ids': target_ids,
+        'lm_labels': lm_labels
+    }

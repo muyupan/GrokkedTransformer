@@ -23,6 +23,15 @@ from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+# Add after the existing imports (around line 30)
+from utils import (
+    compute_accuracy,
+    compute_confidence_calibration,
+    compute_hallucination_metrics,
+    compute_attention_entropy,
+)
+
+
 import torch.multiprocessing as mp
 from tqdm.auto import tqdm, trange
 from transformers.optimization import (
@@ -133,8 +142,8 @@ class Seq2SeqModule(nn.Module):
         super(Seq2SeqModule, self).__init__()
         self.lm = language_model
 
-    def forward(self, target_ids=None, lm_labels=None):
-        return self.lm(target_ids, labels=lm_labels)[0]
+    def forward(self, target_ids=None, lm_labels=None, **kwargs):
+        return self.lm(target_ids, labels=lm_labels, **kwargs)
 
     def save_pretrained(self, output_dir):
         self.lm.save_pretrained(output_dir)
@@ -795,11 +804,20 @@ class Seq2SeqModel:
                 inputs = self._get_inputs_dict(batch)
                 # print(inputs['target_ids'][0])
                 # print(inputs['lm_labels'][0])
+                # if args.fp16:
+                #     with amp.autocast():
+                #         loss = model(**inputs)
+                # else:
+                #     loss = model(**inputs)
+
+                # current_epoch_losses[0] += loss.item()
                 if args.fp16:
                     with amp.autocast():
-                        loss = model(**inputs)
+                        outputs = model(**inputs)
+                        loss = outputs.loss if hasattr(outputs, 'loss') else outputs[0]
                 else:
-                    loss = model(**inputs)
+                    outputs = model(**inputs)
+                    loss = outputs.loss if hasattr(outputs, 'loss') else outputs[0]
 
                 current_epoch_losses[0] += loss.item()
                 steps_avg += 1
@@ -862,37 +880,59 @@ class Seq2SeqModel:
                     #         )
 
                     if ((args.save_steps > 0) and (global_step % args.save_steps == 0)) or (save_step_dense>0 and global_step % save_step_dense_interval == 0 and global_step<=save_step_dense):
-                            # save/eval via step only when epoch number is less
-                            output_dir_current = os.path.join(
-                                output_dir, "checkpoint-{}".format(global_step)
+                        # save/eval via step only when epoch number is less
+                        output_dir_current = os.path.join(
+                            output_dir, "checkpoint-{}".format(global_step)
+                        )
+
+                        self.save_model(
+                            output_dir_current, optimizer, scheduler, model=model
+                        )
+                        
+                        if args.evaluate_during_training:
+                            results = self.eval_model(
+                                eval_dataloader,
+                                verbose=verbose,
+                                silent=args.evaluate_during_training_silent,
+                                **kwargs,
+                            )
+                            training_progress_scores["global_step"].append(global_step)
+                            training_progress_scores["epoch"].append(-1)
+                            training_progress_scores["train_loss"].append(-1.0)
+                            for key in results:
+                                training_progress_scores[key].append(results[key])
+                            report = pd.DataFrame(training_progress_scores)
+                            report.to_csv(
+                                os.path.join(output_dir, "training_progress_scores.csv"),
+                                index=False,
                             )
 
-                            self.save_model(
-                                output_dir_current, optimizer, scheduler, model=model
-                            )
-                            
-                            if args.evaluate_during_training:
-                                results = self.eval_model(
-                                    eval_dataloader,
-                                    verbose=verbose,
-                                    silent=args.evaluate_during_training_silent,
-                                    **kwargs,
-                                )
-                                training_progress_scores["global_step"].append(global_step)
-                                training_progress_scores["epoch"].append(-1)
-                                training_progress_scores["train_loss"].append(-1.0)
-                                for key in results:
-                                    training_progress_scores[key].append(results[key])
-                                report = pd.DataFrame(training_progress_scores)
-                                report.to_csv(
-                                    os.path.join(output_dir, "training_progress_scores.csv"),
-                                    index=False,
-                                )
+                            if (not self.distributed) and args.predict_during_training:
+                                self.predict(test_data, output_dir_current, skip_model_moving=True)
 
-                                if (not self.distributed) and args.predict_during_training:
-                                    self.predict(test_data, output_dir_current, skip_model_moving=True)
+                            model.train()
 
-                                model.train()
+                    # NEW: Evaluate every N steps without saving checkpoint
+                    elif args.evaluate_during_training and args.evaluate_during_training_steps > 0 and (global_step % args.evaluate_during_training_steps == 0):
+                        results = self.eval_model(
+                            eval_dataloader,
+                            verbose=verbose,
+                            silent=args.evaluate_during_training_silent,
+                            **kwargs,
+                        )
+                        training_progress_scores["global_step"].append(global_step)
+                        training_progress_scores["epoch"].append(-1)
+                        training_progress_scores["train_loss"].append((tr_loss - logging_loss) / args.evaluate_during_training_steps if args.evaluate_during_training_steps > 0 else -1.0)
+                        for key in results:
+                            training_progress_scores[key].append(results[key])
+                        report = pd.DataFrame(training_progress_scores)
+                        report.to_csv(
+                            os.path.join(output_dir, "training_progress_scores.csv"),
+                            index=False,
+                        )
+                        
+                        logging_loss = tr_loss  # Reset logging loss
+                        model.train()
 
                     # relation mean shift
                     if self.relation_mean_shift:
@@ -944,17 +984,13 @@ class Seq2SeqModel:
 
                     if (not self.distributed) and args.predict_during_training:
                         self.predict(test_data, output_dir_current, skip_model_moving=True)
-            else:
-                # if no saving via epoch, just record the training loss for the last epoch
-                training_progress_scores["global_step"].append(global_step)
-                training_progress_scores["epoch"].append(epoch_number)
-                training_progress_scores["train_loss"].append(current_epoch_losses[0].cpu().item())
-                training_progress_scores["eval_loss"].append(-1.0)
-                report = pd.DataFrame(training_progress_scores)
-                report.to_csv(
-                    os.path.join(output_dir, "training_progress_scores.csv"),
-                    index=False,
-                )
+            # else:
+            #     # if no saving via epoch, just record the training loss for the last epoch
+            #     training_progress_scores["global_step"].append(global_step)
+            #     training_progress_scores["epoch"].append(epoch_number)
+            #     training_progress_scores["train_loss"].append(current_epoch_losses[0].cpu().item())
+            #     training_progress_scores["eval_loss"].append(-1.0)
+                
             
         return (
             global_step,
@@ -963,9 +999,9 @@ class Seq2SeqModel:
             else training_progress_scores,
         )
 
-    def eval_model(
-        self, eval_dataloader, verbose=True, silent=False, **kwargs
-    ):
+
+# eval_model for arithmetic dataset
+    def eval_model(self, eval_dataloader, verbose=True, silent=False, **kwargs):
         """
         Evaluates the model on eval_data. Saves results to output_dir.
 
@@ -973,54 +1009,166 @@ class Seq2SeqModel:
             verbose: If verbose, results will be printed to the console on completion of evaluation.
             silent: If silent, tqdm progress bars will be hidden.
             **kwargs: Additional metrics that should be used. Pass in the metrics as keyword arguments (name of metric: function to use).
-                        A metric function should take in two parameters. The first parameter will be the true labels, and the second parameter will be the predictions. Both inputs
-                        will be lists of strings. Note that this will slow down evaluation significantly as the predicted sequences need to be generated.
+                    A metric function should take in two parameters. The first parameter will be the true labels, and the second parameter will be the predictions.
+                    Both inputs will be lists of strings. Note that this will slow down evaluation significantly as the predicted sequences need to be generated.
+
         Returns:
             results: Dictionary containing evaluation results.
-        """  # noqa: ignore flake8"
-
-        # self._move_model_to_device()
+        """  # noqa: ignore flake8
 
         model = self.model
         args = self.args
 
         results = {}
-
         LM_loss = torch.zeros(1).to(self.device)
         nb_eval_steps = 0
-        model.eval()
+        
+        # For hallucination metrics
+        all_logits = []
+        all_labels = []
+        all_attentions = []
 
-        # if args.n_gpu > 1:
-        #     model = torch.nn.DataParallel(model)
+        model.eval()
 
         if self.args.fp16:
             from torch.cuda import amp
 
-        for batch in tqdm(
-            eval_dataloader, disable=args.silent or silent, desc="Running Evaluation"
-        ):
-            # batch = tuple(t.to(device) for t in batch)
-
+        for batch in tqdm(eval_dataloader, disable=args.silent or silent, desc="Running Evaluation"):
             inputs = self._get_inputs_dict(batch)
+
             with torch.no_grad():
+                # if self.args.fp16:
+                #     with amp.autocast():
+                #         outputs = model(**inputs, output_attentions=True)
+                #         tmp_LM_loss = outputs[0]
+                # else:
+                #     outputs = model(**inputs, output_attentions=True)
+                #     tmp_LM_loss = outputs[0]
                 if self.args.fp16:
                     with amp.autocast():
-                        tmp_LM_loss = model(**inputs)
+                        outputs = model(**inputs, output_attentions=True)
                 else:
-                    tmp_LM_loss = model(**inputs)
-                # if self.args.n_gpu > 1:
-                #     tmp_eval_loss = tmp_eval_loss.mean()
+                    outputs = model(**inputs, output_attentions=True)
+                
+                # Handle both scalar and tuple outputs
+                if isinstance(outputs, torch.Tensor) and outputs.dim() == 0:
+                    tmp_LM_loss = outputs
+                    # Need to get logits separately - call without labels
+                    logits_outputs = self.lm(inputs['target_ids'] if 'target_ids' in inputs else inputs['input_ids'], output_attentions=True)
+                    logits = logits_outputs.logits if hasattr(logits_outputs, 'logits') else logits_outputs[0]
+                else:
+                    tmp_LM_loss = outputs.loss if hasattr(outputs, 'loss') else outputs[0]
+                    logits = outputs.logits if hasattr(outputs, 'logits') else outputs[1]
+                labels = inputs['lm_labels']
+                
+                all_logits.append(logits.detach().float().cpu())
+                all_labels.append(labels.detach().cpu())
+                
+                # Collect attention if available
+                if hasattr(outputs, 'attentions') and outputs.attentions is not None:
+                    all_attentions.append(torch.stack(outputs.attentions).detach().float().cpu())
+
                 LM_loss[0] += tmp_LM_loss.item()
+                nb_eval_steps += 1
 
-            nb_eval_steps += 1
+        LM_loss = LM_loss / nb_eval_steps
 
-        LM_loss = LM_loss/nb_eval_steps
         if self.distributed:
             dist.all_reduce(LM_loss, op=dist.ReduceOp.AVG)
 
         results["eval_loss"] = LM_loss[0].cpu().item()
 
+        # Compute custom hallucination metrics
+        if all_logits and all_labels:
+            all_logits = torch.cat(all_logits, dim=0)
+            all_labels = torch.cat(all_labels, dim=0).flatten()
+            
+            # Flatten logits to (total_tokens, vocab_size)
+            all_logits = all_logits.view(-1, all_logits.size(-1))
+            
+            # Remove padding tokens
+            mask = all_labels != -100
+            all_logits = all_logits[mask]
+            all_labels = all_labels[mask]
+            
+            # Compute metrics
+            accuracy = compute_accuracy(all_logits, all_labels)
+            calibration = compute_confidence_calibration(all_logits, all_labels)
+            hallucination = compute_hallucination_metrics(all_logits, all_labels)
+            
+            results['eval_accuracy'] = accuracy
+            results['eval_ece'] = calibration['ece']
+            results['eval_mce'] = calibration['mce']
+            results['eval_avg_correct_conf'] = calibration['avg_correct_confidence']
+            results['eval_avg_incorrect_conf'] = calibration['avg_incorrect_confidence']
+            results['eval_hallucination_rate'] = hallucination['hallucination_rate']
+            results['eval_high_conf_accuracy'] = hallucination['high_conf_accuracy']
+            
+            # Compute attention entropy if available
+            if all_attentions:
+                attention_entropy = compute_attention_entropy(torch.cat(all_attentions, dim=1))
+                results['eval_attention_entropy'] = attention_entropy
+
         return results
+
+    # def eval_model(
+    #     self, eval_dataloader, verbose=True, silent=False, **kwargs
+    # ):
+    #     """
+    #     Evaluates the model on eval_data. Saves results to output_dir.
+
+    #     Args:
+    #         verbose: If verbose, results will be printed to the console on completion of evaluation.
+    #         silent: If silent, tqdm progress bars will be hidden.
+    #         **kwargs: Additional metrics that should be used. Pass in the metrics as keyword arguments (name of metric: function to use).
+    #                     A metric function should take in two parameters. The first parameter will be the true labels, and the second parameter will be the predictions. Both inputs
+    #                     will be lists of strings. Note that this will slow down evaluation significantly as the predicted sequences need to be generated.
+    #     Returns:
+    #         results: Dictionary containing evaluation results.
+    #     """  # noqa: ignore flake8"
+
+    #     # self._move_model_to_device()
+
+    #     model = self.model
+    #     args = self.args
+
+    #     results = {}
+
+    #     LM_loss = torch.zeros(1).to(self.device)
+    #     nb_eval_steps = 0
+    #     model.eval()
+
+    #     # if args.n_gpu > 1:
+    #     #     model = torch.nn.DataParallel(model)
+
+    #     if self.args.fp16:
+    #         from torch.cuda import amp
+
+    #     for batch in tqdm(
+    #         eval_dataloader, disable=args.silent or silent, desc="Running Evaluation"
+    #     ):
+    #         # batch = tuple(t.to(device) for t in batch)
+
+    #         inputs = self._get_inputs_dict(batch)
+    #         with torch.no_grad():
+    #             if self.args.fp16:
+    #                 with amp.autocast():
+    #                     tmp_LM_loss = model(**inputs)
+    #             else:
+    #                 tmp_LM_loss = model(**inputs)
+    #             # if self.args.n_gpu > 1:
+    #             #     tmp_eval_loss = tmp_eval_loss.mean()
+    #             LM_loss[0] += tmp_LM_loss.item()
+
+    #         nb_eval_steps += 1
+
+    #     LM_loss = LM_loss/nb_eval_steps
+    #     if self.distributed:
+    #         dist.all_reduce(LM_loss, op=dist.ReduceOp.AVG)
+
+    #     results["eval_loss"] = LM_loss[0].cpu().item()
+
+    #     return results
 
 
     def predict(self, pred_data, output_dir, cutoff=None, skip_model_moving=False, out_file="all_items.json"):
@@ -1185,14 +1333,28 @@ class Seq2SeqModel:
 
     def _create_training_progress_scores(self, **kwargs):
         extra_metrics = {key: [] for key in kwargs}
+        # training_progress_scores = {
+        #     "global_step": [],
+        #     "epoch": [],
+        #     "eval_loss": [],
+        #     "train_loss": [],
+        #     **extra_metrics,
+        # }
         training_progress_scores = {
             "global_step": [],
             "epoch": [],
-            "eval_loss": [],
             "train_loss": [],
+            "eval_loss": [],
+            "eval_accuracy": [],
+            "eval_ece": [],
+            "eval_mce": [],
+            "eval_avg_correct_conf": [],
+            "eval_avg_incorrect_conf": [],
+            "eval_hallucination_rate": [],
+            "eval_high_conf_accuracy": [],
+            "eval_attention_entropy": [],
             **extra_metrics,
         }
-
         return training_progress_scores
 
     def _get_last_metrics(self, metric_values):
